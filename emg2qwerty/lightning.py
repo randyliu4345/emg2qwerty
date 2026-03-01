@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
@@ -23,10 +25,13 @@ from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
+    RNNEncoder,
     SpectrogramNorm,
     TDSConvEncoder,
 )
 from emg2qwerty.transforms import Transform
+
+log = logging.getLogger(__name__)
 
 
 class WindowedEMGDataModule(pl.LightningDataModule):
@@ -42,6 +47,9 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         train_transform: Transform[np.ndarray, torch.Tensor],
         val_transform: Transform[np.ndarray, torch.Tensor],
         test_transform: Transform[np.ndarray, torch.Tensor],
+        channel_indices: Sequence[int] | None = None,
+        train_fraction: float = 1.0,
+        downsample_factor: int = 1,
     ) -> None:
         super().__init__()
 
@@ -59,6 +67,10 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         self.val_transform = val_transform
         self.test_transform = test_transform
 
+        self.channel_indices = channel_indices
+        self.train_fraction = train_fraction
+        self.downsample_factor = downsample_factor
+
     def setup(self, stage: str | None = None) -> None:
         self.train_dataset = ConcatDataset(
             [
@@ -68,6 +80,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     window_length=self.window_length,
                     padding=self.padding,
                     jitter=True,
+                    channel_indices=self.channel_indices,
+                    train_fraction=self.train_fraction,
                 )
                 for hdf5_path in self.train_sessions
             ]
@@ -80,6 +94,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     window_length=self.window_length,
                     padding=self.padding,
                     jitter=False,
+                    channel_indices=self.channel_indices,
+                    train_fraction=1.0,  # Don't subsample validation
                 )
                 for hdf5_path in self.val_sessions
             ]
@@ -94,6 +110,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     window_length=None,
                     padding=(0, 0),
                     jitter=False,
+                    channel_indices=self.channel_indices,
+                    train_fraction=1.0,  # Don't subsample test
                 )
                 for hdf5_path in self.test_sessions
             ]
@@ -150,17 +168,45 @@ class TDSConvCTCModule(pl.LightningModule):
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
+        num_channels: int = 32,
+        train_fraction: float = 1.0,
+        downsample_factor: int = 1,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        
+        # Store experiment metadata
+        self.num_channels = num_channels
+        self.train_fraction = train_fraction
+        self.downsample_factor = downsample_factor
+        
+        # Log experiment metadata
+        log.info(f"Experiment metadata: num_channels={self.num_channels}, "
+                f"train_fraction={self.train_fraction}, "
+                f"downsample_factor={self.downsample_factor}")
+        print(f"Experiment metadata: num_channels={self.num_channels}, "
+              f"train_fraction={self.train_fraction}, "
+              f"downsample_factor={self.downsample_factor}", file=sys.stdout)
 
         num_features = self.NUM_BANDS * mlp_features[-1]
 
+        # Calculate channels per band from total num_channels
+        channels_per_band = num_channels // self.NUM_BANDS
+        # Calculate in_features dynamically: freq_bins * channels_per_band
+        # freq_bins = n_fft // 2 + 1 = 64 // 2 + 1 = 33
+        freq_bins = 33
+        # Override in_features parameter with calculated value based on actual channels
+        in_features = freq_bins * channels_per_band
+        
+        # Verify calculation matches expected values
+        log.info(f"Model config: channels_per_band={channels_per_band}, "
+                f"in_features={in_features} (freq_bins={freq_bins} * channels_per_band={channels_per_band})")
+
         # Model
-        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        # inputs: (T, N, bands=2, electrode_channels, freq)
         self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
-            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, C, freq)
+            SpectrogramNorm(channels=num_channels),
             # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
@@ -242,7 +288,21 @@ class TDSConvCTCModule(pl.LightningModule):
 
     def _epoch_end(self, phase: str) -> None:
         metrics = self.metrics[f"{phase}_metrics"]
-        self.log_dict(metrics.compute(), sync_dist=True)
+        computed_metrics = metrics.compute()
+        self.log_dict(computed_metrics, sync_dist=True)
+        
+        # Log validation CER to stdout/stderr each epoch
+        if phase == "val":
+            # The metric key includes the prefix, so it's "val/CER"
+            cer_key = f"{phase}/CER"
+            if cer_key in computed_metrics:
+                cer_value = computed_metrics[cer_key]
+                epoch = self.current_epoch
+                log_msg = f"Epoch {epoch}: val/CER = {cer_value:.4f}"
+                log.info(log_msg)
+                print(log_msg, file=sys.stdout)
+                print(log_msg, file=sys.stderr)
+        
         metrics.reset()
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:

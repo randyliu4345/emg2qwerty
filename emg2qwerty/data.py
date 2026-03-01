@@ -443,6 +443,12 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             a window/slice of `EMGSessionData` in the form of a numpy
             structured array and returns a `torch.Tensor` instance.
             (default: ``emg2qwerty.transforms.ToTensor()``)
+        channel_indices (list[int] | None): List of channel indices to select
+            from the electrode channels. Applied after transform. If None, uses
+            all channels. (default: ``None``)
+        train_fraction (float): Fraction of training examples to use (0.0 to 1.0).
+            1.0 means use all examples. Randomly subsamples indices.
+            (default: ``1.0``)
     """
 
     hdf5_path: Path
@@ -451,6 +457,8 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
     padding: InitVar[tuple[int, int]] = (0, 0)
     jitter: bool = False
     transform: Transform[np.ndarray, torch.Tensor] = field(default_factory=ToTensor)
+    channel_indices: Sequence[int] | None = None
+    train_fraction: float = 1.0
 
     def __post_init__(
         self,
@@ -473,7 +481,27 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         (self.left_padding, self.right_padding) = padding
         assert self.left_padding >= 0 and self.right_padding >= 0
 
+        # Validate train_fraction
+        assert 0.0 < self.train_fraction <= 1.0, "train_fraction must be in (0.0, 1.0]"
+
+        # Convert channel_indices to list if provided
+        if self.channel_indices is not None:
+            self.channel_indices = list(self.channel_indices)
+
+        # Compute total number of windows and create subsampled indices
+        total_windows = int(max(self.session_length - self.window_length, 0) // self.stride + 1)
+        if self.train_fraction < 1.0:
+            num_samples = int(total_windows * self.train_fraction)
+            # Create a random subset of indices using numpy for reproducibility
+            all_indices = np.arange(total_windows)
+            np.random.shuffle(all_indices)
+            self.sampled_indices = sorted(all_indices[:num_samples].tolist())
+        else:
+            self.sampled_indices = None  # Use all indices
+
     def __len__(self) -> int:
+        if self.sampled_indices is not None:
+            return len(self.sampled_indices)
         return int(max(self.session_length - self.window_length, 0) // self.stride + 1)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -482,7 +510,13 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         if not hasattr(self, "session"):
             self.session = EMGSessionData(self.hdf5_path)
 
-        offset = idx * self.stride
+        # Map to actual index if using subsampled indices
+        if self.sampled_indices is not None:
+            actual_idx = self.sampled_indices[idx]
+        else:
+            actual_idx = idx
+
+        offset = actual_idx * self.stride
 
         # Randomly jitter the window offset.
         leftover = len(self.session) - (offset + self.window_length)
@@ -499,6 +533,16 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         # Extract EMG tensor corresponding to the window.
         emg = self.transform(window)
         assert torch.is_tensor(emg)
+
+        # Apply channel selection if specified
+        # Expected shape after transform: (T, B, C, freq) for single sample
+        # After collation: (T, N, B, C, freq)
+        # We select channels from dimension C (index 2 for single sample, index 3 after collation)
+        if self.channel_indices is not None:
+            # For single sample before collation, shape is (T, B, C, freq)
+            # Channel dimension is at index 2
+            channel_tensor = torch.tensor(self.channel_indices, dtype=torch.long)
+            emg = emg.index_select(dim=2, index=channel_tensor)
 
         # Extract labels corresponding to the original (un-padded) window.
         timestamps = window[EMGSessionData.TIMESTAMPS]

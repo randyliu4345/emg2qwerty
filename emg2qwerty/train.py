@@ -55,11 +55,20 @@ def main(config: DictConfig):
 
     # Instantiate LightningModule
     log.info(f"Instantiating LightningModule {config.module}")
+    # Calculate num_channels: if channel_indices provided, use that count per band * 2 bands, else 16 per band * 2 bands = 32
+    channel_indices = config.data.get("channel_indices")
+    if channel_indices is not None:
+        num_channels = len(channel_indices) * 2  # 2 bands (left and right)
+    else:
+        num_channels = 16 * 2  # 16 channels per band * 2 bands
     module = instantiate(
         config.module,
         optimizer=config.optimizer,
         lr_scheduler=config.lr_scheduler,
         decoder=config.decoder,
+        num_channels=num_channels,
+        train_fraction=config.data.get("train_fraction", 1.0),
+        downsample_factor=config.data.get("downsample_factor", 1),
         _recursive_=False,
     )
     if config.checkpoint is not None:
@@ -69,6 +78,9 @@ def main(config: DictConfig):
             optimizer=config.optimizer,
             lr_scheduler=config.lr_scheduler,
             decoder=config.decoder,
+            num_channels=num_channels,
+            train_fraction=config.data.get("train_fraction", 1.0),
+            downsample_factor=config.data.get("downsample_factor", 1),
         )
 
     # Instantiate LightningDataModule
@@ -83,6 +95,9 @@ def main(config: DictConfig):
         train_transform=_build_transform(config.transforms.train),
         val_transform=_build_transform(config.transforms.val),
         test_transform=_build_transform(config.transforms.test),
+        channel_indices=config.data.get("channel_indices"),
+        train_fraction=config.data.get("train_fraction", 1.0),
+        downsample_factor=config.data.get("downsample_factor", 1),
         _convert_="object",
     )
 
