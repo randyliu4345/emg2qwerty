@@ -345,16 +345,39 @@ class LSTMCTCModule(pl.LightningModule):
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
+        num_channels: int = 32,
+        train_fraction: float = 1.0,
+        downsample_factor: int = 1,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        
+        # Store experiment metadata
+        self.num_channels = num_channels
+        self.train_fraction = train_fraction
+        self.downsample_factor = downsample_factor
+        
+        # Log experiment metadata
+        log.info(f"Experiment metadata: num_channels={self.num_channels}, "
+                f"train_fraction={self.train_fraction}, "
+                f"downsample_factor={self.downsample_factor}")
+        print(f"Experiment metadata: num_channels={self.num_channels}, "
+              f"train_fraction={self.train_fraction}, "
+              f"downsample_factor={self.downsample_factor}", file=sys.stdout)
 
         num_features = self.NUM_BANDS * mlp_features[-1]
         lstm_out_features = lstm_hidden_size * (2 if bidirectional else 1)
 
+        # Calculate channels per band from total num_channels
+        channels_per_band = num_channels // self.NUM_BANDS
+        # Calculate in_features dynamically: freq_bins * channels_per_band
+        # freq_bins = n_fft // 2 + 1 = 64 // 2 + 1 = 33
+        freq_bins = 33
+        in_features = freq_bins * channels_per_band
+
         # Frontend: same as TDSConvCTCModule up through Flatten
         self.frontend = nn.Sequential(
-            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            SpectrogramNorm(channels=num_channels),
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
