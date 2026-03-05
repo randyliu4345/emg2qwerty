@@ -449,6 +449,9 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         train_fraction (float): Fraction of training examples to use (0.0 to 1.0).
             1.0 means use all examples. Randomly subsamples indices.
             (default: ``1.0``)
+        downsample_factor (int): Temporal downsampling factor. Every Nth sample
+            is kept, reducing temporal resolution by a factor of N. Applied to
+            raw EMG data before transform. (default: ``1``)
     """
 
     hdf5_path: Path
@@ -459,6 +462,7 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
     transform: Transform[np.ndarray, torch.Tensor] = field(default_factory=ToTensor)
     channel_indices: Sequence[int] | None = None
     train_fraction: float = 1.0
+    downsample_factor: int = 1
 
     def __post_init__(
         self,
@@ -469,7 +473,7 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         with EMGSessionData(self.hdf5_path) as session:
             assert (
                 session.condition == "on_keyboard"
-            ), f"Unsupported condition {self.session.condition}"
+            ), f"Unsupported condition {session.condition}"
             self.session_length = len(session)
 
         self.window_length = (
@@ -481,20 +485,30 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         (self.left_padding, self.right_padding) = padding
         assert self.left_padding >= 0 and self.right_padding >= 0
 
-        # Validate train_fraction
+        # Validate train_fraction and downsample_factor
         assert 0.0 < self.train_fraction <= 1.0, "train_fraction must be in (0.0, 1.0]"
+        assert self.downsample_factor >= 1, "downsample_factor must be >= 1"
 
         # Convert channel_indices to list if provided
         if self.channel_indices is not None:
             self.channel_indices = list(self.channel_indices)
 
-        # Compute total number of windows and create subsampled indices
-        total_windows = int(max(self.session_length - self.window_length, 0) // self.stride + 1)
+        # Compute total number of windows accounting for downsampling
+        # After downsampling, we have fewer samples, so fewer possible windows
+        # But we still use original window_length and stride for fetching from HDF5
+        # The effective number of windows is reduced because downsampling reduces temporal resolution
+        effective_session_length = self.session_length // self.downsample_factor
+        effective_window_length = self.window_length // self.downsample_factor
+        effective_stride = max(self.stride // self.downsample_factor, 1)
+        
+        total_windows = int(max(effective_session_length - effective_window_length, 0) // effective_stride + 1)
         if self.train_fraction < 1.0:
             num_samples = int(total_windows * self.train_fraction)
             # Create a random subset of indices using numpy for reproducibility
+            # Use a seeded RNG to ensure reproducibility across runs
+            rng = np.random.RandomState(seed=1501)  # Use same seed as in train.py
             all_indices = np.arange(total_windows)
-            np.random.shuffle(all_indices)
+            rng.shuffle(all_indices)
             self.sampled_indices = sorted(all_indices[:num_samples].tolist())
         else:
             self.sampled_indices = None  # Use all indices
@@ -516,19 +530,43 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         else:
             actual_idx = idx
 
-        offset = actual_idx * self.stride
+        # Calculate effective stride accounting for downsampling
+        # The stride is already calculated in __post_init__ accounting for downsampling
+        effective_stride = max(self.stride // self.downsample_factor, 1)
+        
+        # Calculate offset in original sample space
+        # We need to fetch more samples from HDF5 to account for downsampling
+        offset_original = actual_idx * self.stride
 
-        # Randomly jitter the window offset.
-        leftover = len(self.session) - (offset + self.window_length)
+        # Randomly jitter the window offset (in original sample space).
+        leftover = len(self.session) - (offset_original + self.window_length)
         if leftover < 0:
             raise IndexError(f"Index {idx} out of bounds")
         if leftover > 0 and self.jitter:
-            offset += np.random.randint(0, min(self.stride, leftover))
+            jitter_max = min(self.stride, leftover)
+            offset_original += np.random.randint(0, jitter_max)
 
-        # Expand window to include contextual padding and fetch.
-        window_start = max(offset - self.left_padding, 0)
-        window_end = offset + self.window_length + self.right_padding
+        # Expand window to include contextual padding and fetch from original sample space
+        window_start = max(offset_original - self.left_padding, 0)
+        window_end = offset_original + self.window_length + self.right_padding
         window = self.session[window_start:window_end]
+
+        # Apply temporal downsampling to raw EMG data before transform
+        if self.downsample_factor > 1:
+            # Downsample EMG arrays (keep every Nth sample)
+            # Structured array indexing: window[field_name] gets the field
+            emg_left = window[EMGSessionData.EMG_LEFT][::self.downsample_factor]
+            emg_right = window[EMGSessionData.EMG_RIGHT][::self.downsample_factor]
+            timestamps = window[EMGSessionData.TIMESTAMPS][::self.downsample_factor]
+            
+            # Reconstruct window with downsampled data
+            # Create a new structured array with downsampled data
+            dtype = window.dtype
+            downsampled_window = np.empty(len(emg_left), dtype=dtype)
+            downsampled_window[EMGSessionData.EMG_LEFT] = emg_left
+            downsampled_window[EMGSessionData.EMG_RIGHT] = emg_right
+            downsampled_window[EMGSessionData.TIMESTAMPS] = timestamps
+            window = downsampled_window
 
         # Extract EMG tensor corresponding to the window.
         emg = self.transform(window)
@@ -545,9 +583,22 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             emg = emg.index_select(dim=2, index=channel_tensor)
 
         # Extract labels corresponding to the original (un-padded) window.
-        timestamps = window[EMGSessionData.TIMESTAMPS]
-        start_t = timestamps[offset - window_start]
-        end_t = timestamps[(offset + self.window_length - 1) - window_start]
+        # Use timestamps from the window (which may be downsampled)
+        # But we need to map back to original timestamps for label extraction
+        if self.downsample_factor > 1:
+            # Get original timestamps before downsampling for label extraction
+            original_window = self.session[window_start:window_end]
+            timestamps_for_labels = original_window[EMGSessionData.TIMESTAMPS]
+            # Calculate the actual window in original space (without padding)
+            actual_window_start_in_original = offset_original - window_start
+            actual_window_end_in_original = actual_window_start_in_original + self.window_length
+        else:
+            timestamps_for_labels = window[EMGSessionData.TIMESTAMPS]
+            actual_window_start_in_original = offset_original - window_start
+            actual_window_end_in_original = actual_window_start_in_original + self.window_length
+        
+        start_t = timestamps_for_labels[actual_window_start_in_original]
+        end_t = timestamps_for_labels[actual_window_end_in_original - 1]
         label_data = self.session.ground_truth(start_t, end_t)
         labels = torch.as_tensor(label_data.labels)
 

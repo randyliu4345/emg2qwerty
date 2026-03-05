@@ -82,6 +82,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     jitter=True,
                     channel_indices=self.channel_indices,
                     train_fraction=self.train_fraction,
+                    downsample_factor=self.downsample_factor,
                 )
                 for hdf5_path in self.train_sessions
             ]
@@ -96,6 +97,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     jitter=False,
                     channel_indices=self.channel_indices,
                     train_fraction=1.0,  # Don't subsample validation
+                    downsample_factor=self.downsample_factor,
                 )
                 for hdf5_path in self.val_sessions
             ]
@@ -112,6 +114,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     jitter=False,
                     channel_indices=self.channel_indices,
                     train_fraction=1.0,  # Don't subsample test
+                    downsample_factor=self.downsample_factor,
                 )
                 for hdf5_path in self.test_sessions
             ]
@@ -195,12 +198,7 @@ class TDSConvCTCModule(pl.LightningModule):
         # Calculate in_features dynamically: freq_bins * channels_per_band
         # freq_bins = n_fft // 2 + 1 = 64 // 2 + 1 = 33
         freq_bins = 33
-        # Override in_features parameter with calculated value based on actual channels
         in_features = freq_bins * channels_per_band
-        
-        # Verify calculation matches expected values
-        log.info(f"Model config: channels_per_band={channels_per_band}, "
-                f"in_features={in_features} (freq_bins={freq_bins} * channels_per_band={channels_per_band})")
 
         # Model
         # inputs: (T, N, bands=2, electrode_channels, freq)
@@ -329,3 +327,4 @@ class TDSConvCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+        
