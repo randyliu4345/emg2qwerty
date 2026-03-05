@@ -25,10 +25,10 @@ from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
-    RNNEncoder,
     SpectrogramNorm,
     TDSConvEncoder,
 )
+
 from emg2qwerty.transforms import Transform
 
 log = logging.getLogger(__name__)
