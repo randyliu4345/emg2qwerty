@@ -243,3 +243,119 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+
+@dataclass
+class GaussianNoiseJitter:
+    """Adds small Gaussian noise jittering to the input tensor as a data
+    augmentation technique. The noise is sampled from a zero-mean Gaussian
+    distribution with the specified standard deviation.
+
+    Args:
+        std (float): Standard deviation of the Gaussian noise to add.
+            (default: 0.01)
+    """
+
+    std: float = 0.01
+
+    def __post_init__(self) -> None:
+        assert self.std >= 0, "std must be non-negative"
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        noise = torch.randn_like(tensor) * self.std
+        return tensor + noise
+
+
+@dataclass
+class TimeWarp:
+    """Applies time warping augmentation by locally stretching or compressing
+    the time axis of the signal using PyTorch-native operations. This mimics
+    natural timing variations in keystroke patterns.
+
+    Time warping generates a smooth, random warp curve by sampling positive
+    increments between knot points (guaranteeing strict monotonicity), then
+    resamples the signal along this warped time axis using vectorized piecewise
+    linear interpolation and PyTorch gather. The output has the same length as
+    the input, but with locally stretched/compressed regions.
+
+    This implementation is fully GPU-compatible, using only PyTorch operations
+    with no Python loops over time or knot segments.
+
+    Args:
+        sigma (float): Controls the randomness/aggressiveness of the warp.
+            Higher values produce more extreme local stretching/compression.
+            Typical values: 0.05 (subtle), 0.1-0.2 (moderate), 0.3+ (aggressive).
+            (default: 0.1)
+        knots (int): Number of internal knot points (excluding endpoints) for
+            the warp curve. More knots allow more complex warps. (default: 4)
+    """
+
+    sigma: float = 0.1
+    knots: int = 4
+
+    def __post_init__(self) -> None:
+        assert self.sigma >= 0, "sigma must be non-negative"
+        assert self.knots >= 1, "knots must be at least 1"
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tensor: Input tensor of shape (T, ...) where T is the time dimension.
+
+        Returns:
+            Warped tensor of the same shape as input.
+        """
+        T = tensor.shape[0]
+        if T <= 1:
+            return tensor
+
+        device = tensor.device
+        dtype = tensor.dtype
+
+        # --- Build monotonic warp path via positive increments ---
+        # Sample K+2 positive gaps (including endpoints), then cumsum + rescale.
+        # This guarantees strict monotonicity by construction, avoiding the
+        # fragile "cumulative max" approach.
+        num_knots = self.knots + 2  # includes start and end
+        gaps = torch.abs(torch.randn(num_knots, device=device, dtype=dtype)) * self.sigma + (1.0 / num_knots)
+        knot_warps = torch.cumsum(gaps, dim=0)
+        knot_warps = knot_warps / knot_warps[-1] * (T - 1)  # rescale to [0, T-1]
+        knot_warps[0] = 0.0
+        knot_warps[-1] = float(T - 1)
+
+        # Evenly-spaced source knot locations (fixed)
+        knot_indices = torch.linspace(0, T - 1, num_knots, device=device, dtype=dtype)
+
+        # --- Vectorized piecewise linear interpolation ---
+        # For each of the T output time steps, find which knot segment it falls
+        # in, then linearly interpolate the corresponding warped index.
+        time_grid = torch.arange(T, device=device, dtype=dtype)  # (T,)
+
+        # Segment indices: how many knot boundaries each t has passed
+        t_expand = time_grid.unsqueeze(1)                        # (T, 1)
+        ki = knot_indices.unsqueeze(0)                           # (1, K)
+        seg = (t_expand >= ki).sum(dim=1) - 1                    # (T,)
+        seg = seg.clamp(0, num_knots - 2)
+
+        x0 = knot_indices[seg]    # (T,)
+        x1 = knot_indices[seg + 1]
+        y0 = knot_warps[seg]
+        y1 = knot_warps[seg + 1]
+
+        t_frac = (time_grid - x0) / (x1 - x0 + 1e-8)
+        warped_indices = (y0 + t_frac * (y1 - y0)).clamp(0.0, float(T - 1))  # (T,)
+
+        # --- Resample via linear interpolation ---
+        idx_low = warped_indices.floor().long()                  # (T,)
+        idx_high = (idx_low + 1).clamp(0, T - 1)                # (T,)
+
+        # alpha broadcasts over all trailing dims regardless of tensor rank
+        alpha = (warped_indices - idx_low.float())
+        for _ in range(tensor.ndim - 1):
+            alpha = alpha.unsqueeze(-1)                          # (T, 1, 1, ...)
+
+        lower = tensor[idx_low]                                  # (T, ...)
+        upper = tensor[idx_high]                                 # (T, ...)
+        warped = lower * (1.0 - alpha) + upper * alpha
+
+        return warped.to(dtype=dtype)
